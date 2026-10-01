@@ -9,6 +9,7 @@ server's own OpenAPI spec (`/openapi.json`).
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from urllib.parse import urlparse
 from typing import Any, Optional
 
@@ -27,6 +28,29 @@ class Gns3Client:
         self.session = requests.Session()
         self.session.verify = verify
         self._token: Optional[str] = None
+
+    @classmethod
+    def from_creds_file(cls, path: str | Path, verify: bool = False) -> "Gns3Client":
+        """Builds a client from a simple "Key: Value" creds file (e.g. a
+        course project's gitignored creds.txt), reading whichever of
+        "GNS3 IP"/"GNS 3 IP", "Username" and "Password" it finds (match is
+        case-insensitive, other keys are ignored)."""
+        fields: dict[str, str] = {}
+        for line in Path(path).read_text().splitlines():
+            if ":" not in line:
+                continue
+            key, _, value = line.partition(":")
+            fields[key.strip().lower()] = value.strip()
+
+        host = fields.get("gns3 ip") or fields.get("gns 3 ip")
+        username = fields.get("username")
+        password = fields.get("password")
+        missing = [k for k, v in (("GNS3 IP", host), ("Username", username), ("Password", password)) if not v]
+        if missing:
+            raise ValueError(f"{path}: missing {', '.join(missing)}")
+
+        base_url = host if "://" in host else f"http://{host}"
+        return cls(base_url, username, password, verify=verify)
 
     # -- auth -----------------------------------------------------------
     def authenticate(self) -> str:
