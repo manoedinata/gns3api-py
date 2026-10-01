@@ -55,6 +55,28 @@ base64 so binary content survives.
 text = client.pull_node_file(project_id, node_id, "/root/init.sh")
 ```
 
+### Large files
+
+A one-shot pull streams the whole base64 payload as a single console line;
+once the echoed output wraps past the PTY's line limit, bracketed-paste
+toggles and wrap artifacts start landing inside the payload and the decode
+misaligns. `pull_file_chunked()` avoids that class of corruption entirely:
+
+```python
+from gns3api.console import pull_file_chunked
+
+host, port = client.get_console(project_id, node_id)
+text = pull_file_chunked(host, port, "/root/init.sh")
+```
+
+It stages the base64 node-side (`base64 -w`), fetches it in fixed-size page
+windows, and verifies the reassembled content against a node-side md5 before
+returning - a mismatch raises instead of returning silently corrupted data.
+All transport markers embed `#` (outside the base64 alphabet) so payload
+text can never fabricate or truncate a marker match, and each page opens
+with a `#START#` window so the echoed command line - which wraps
+arbitrarily - can never leak into the payload.
+
 ## Console endpoints
 
 The `console_host` field of every node is a bind-all placeholder
@@ -73,8 +95,11 @@ sock = socket.create_connection((host, port), timeout=10)   # telnet-flow automa
 
 `console_exec()` runs a shell command on a node through its telnet console
 and returns the cleaned output. The transport handles the telnet IAC
-negotiation sequences that GNS3 consoles emit, drains a fresh session's
-boot banner, and verifies each command with a unique marker. Both
+negotiation sequences that GNS3 consoles emit and drains a fresh session's
+boot banner passively on connect. Each command runs on its own connection
+(the console server tolerates exactly one outbound line per connection),
+verified with a unique completion marker, and `Gns3Client` transparently
+retries on a reset. Both
 `console_exec()` and `push_node_file()` resolve the endpoint through
 `get_console()` internals, so the project is opened and the node state is
 checked for you.
@@ -113,7 +138,8 @@ update/delete, start/stop/suspend/reload, plus project open/close), node
 file injection (`read/write_node_file`), console endpoint resolution
 (`get_console`, `console_endpoint`), console shell execution
 (`console_exec`), console-channel file transfer (`push_node_file`,
-`pull_node_file`), and the
+`pull_node_file`, chunked variant `pull_file_chunked` in
+[`gns3api/console.py`](gns3api/console.py)), and the
 idempotent builders (`ensure_node`, `ensure_link`). See
 [`gns3api/client.py`](gns3api/client.py) for the full method list, or the
 server's `/docs` and `/openapi.json` for the complete API surface.

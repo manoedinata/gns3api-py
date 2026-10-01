@@ -15,6 +15,7 @@ function here opens a fresh connection per command instead of reusing one
 from __future__ import annotations
 
 import base64
+import hashlib
 import re
 import socket
 import time
@@ -223,3 +224,55 @@ def pull_file(host: str, port: int, path: str, timeout: float = 60.0) -> str:
     if not payload:
         raise RuntimeError(f"{path} unreadable or empty on the node")
     return base64.b64decode(payload).decode()
+
+
+def pull_file_chunked(
+    host: str, port: int, path: str, timeout: float = 180.0, page: int = 100,
+) -> str:
+    """Page-window pull: base64 with line wrapping, fetched through one
+    ``exec_once`` per step, immune to the bracketed-paste/wrap corruption
+    class that hits big one-line pulls (the whole payload never rides a
+    single console line or a single connection).
+
+    Markers embed '#' which is outside the base64 alphabet, so payload text
+    can never fabricate or truncate a marker match; each page opens with a
+    '#START#' window so a wrapped echoed command line can never leak into
+    the base64. The reassembled content is verified against a node-side
+    md5 before returning - a mismatch raises instead of handing back
+    silently corrupted data."""
+    staged = f"/tmp/.gns3api-{time.time_ns() % 9973:04d}.b64"
+    try:
+        exec_once(host, port, f"base64 -w {page} {path} > {staged}", timeout)
+
+        nl_out = exec_once(host, port, f"wc -l < {staged}", timeout)
+        numbers = re.findall(r"(\d+)", nl_out)
+        if not numbers:
+            raise RuntimeError(f"could not count b64 lines for {path}: {nl_out!r}")
+        nlines = int(numbers[0])
+
+        md5_out = exec_once(host, port, f"md5sum {path} | cut -d' ' -f1", timeout)
+        node_md5_m = re.search(r"([0-9a-f]{32})", md5_out)
+        node_md5 = node_md5_m.group(1) if node_md5_m else None
+
+        parts = []
+        for start in range(1, nlines + 1, page):
+            end = min(start + page - 1, nlines)
+            out = exec_once(
+                host, port,
+                f"echo '#START#'; sed -n '{start},{end}p' {staged}", timeout)
+            # everything up to the LAST '#START#' is echoed-command residue
+            # (the echoed command itself contains the literal); the payload
+            # is pure base64 so '#' can never occur inside it
+            parts.append(out[out.rfind("#START#") + len("#START#"):])
+    finally:
+        exec_once(host, port, f"rm -f {staged}", timeout)
+
+    payload = "".join("".join(_ANSI_RE.sub("", p).split()) for p in parts)
+    content = base64.b64decode(payload).decode()
+    if node_md5:
+        local_md5 = hashlib.md5(content.encode()).hexdigest()
+        if local_md5 != node_md5:
+            raise RuntimeError(
+                f"integrity mismatch on {path}: node {node_md5} != local {local_md5}; "
+                f"decoded head: {content[:60]!r}")
+    return content
