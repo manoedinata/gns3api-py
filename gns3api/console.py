@@ -2,7 +2,15 @@
 
 Console automation must survive two protocol quirks: telnet IAC negotiation
 bytes interleaved with shell output (filtered in ``_strip_iac``), and a
-fresh session replaying its boot banner (drained by ``exec``'s handshake).
+fresh session replaying its boot banner (drained passively on connect, see
+``Console._passive_drain``).
+
+Observed in practice against at least one GNS3 compute's console proxy:
+a connection tolerates exactly ONE outbound command line before the server
+resets it (reproduces with a bare socket, no telnet-option replies, on both
+alpine- and debian-based node images -- not specific to either). So every
+function here opens a fresh connection per command instead of reusing one
+``Console`` across multiple sends; see ``_exec_once``.
 """
 from __future__ import annotations
 
@@ -114,21 +122,55 @@ class Console:
         self.buf = buf
         return False, buf.decode(errors="replace")
 
-    def drain(self, timeout: float = 25.0) -> None:
-        """Drops any stale session banner so later reads stay clean."""
+    def _passive_drain(self, timeout: float = 0.4) -> None:
+        """Clears a stale session banner WITHOUT sending anything -- an
+        active probe command would itself consume this connection's one
+        tolerated outbound line (see module docstring)."""
         self.buf = b""
-        self.send_line("echo RS$?RS")
-        self.read_until(b"RS0RS", timeout)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                self.buf += self._recv()
+            except ConnectionError:
+                break
+        self.buf = b""
 
     def exec(self, command: str, timeout: float = 30.0) -> str:
-        """Runs one shell command on the node, returns its cleaned output."""
-        self.drain()
+        """Runs one shell command on a freshly-connected console and returns
+        its output (echoed command line and completion marker both
+        stripped). This must be the ONLY command sent on `self`'s connection
+        (see module docstring) -- callers needing several commands should
+        open a new Console (or use `exec_once`) per command."""
+        self._passive_drain()
         tag = f"X{time.time_ns() % 937:03d}"
-        self.buf = b""
         self.send_line(f"{command}; echo {tag}$?{tag}")
         ok, out = self.read_until((tag + "0" + tag).encode(), timeout)
+        if not ok:
+            # read_until() swallows a mid-stream ConnectionError and returns
+            # whatever partial output it had -- surface that as a failure
+            # instead of handing the caller silently-truncated output, so a
+            # retry wrapper (e.g. Gns3Client._console_retry) can catch it.
+            raise ConnectionError(
+                f"exec({command!r}) did not complete within {timeout}s - stream tail: {out[-160:]!r}"
+            )
         cleaned = _ANSI_RE.sub("", out)
-        return cleaned.split("\n", 1)[-1]
+        body = cleaned.split("\n", 1)[-1]  # drop the echoed command line
+        # the marker is "{tag}{exitcode}{tag}" -- cut at its FIRST occurrence
+        # (not rfind: that would land between the two tag copies and leave
+        # the exit-code digit glued onto the real output, silently
+        # corrupting anything that must match byte-for-byte, e.g. base64).
+        idx = body.find(tag)
+        if idx != -1:
+            body = body[:idx]
+        return body
+
+
+def exec_once(host: str, port: int, command: str, timeout: float = 30.0) -> str:
+    """Opens a fresh connection, runs exactly one command, closes. The
+    building block for any multi-step console operation (see push_file/
+    pull_file below) now that one connection only tolerates one command."""
+    with Console(host, port) as con:
+        return con.exec(command, timeout=timeout)
 
 
 def push_file(
@@ -146,32 +188,26 @@ def push_file(
     chunks = [payload[i:i + CHUNK_SIZE] for i in range(0, len(payload), CHUNK_SIZE)]
     tmp = f"/tmp/.gns3api-{time.time_ns() % 9973:04d}.b64"
 
-    with Console(host, port) as con:
-        con.drain()
-        con.send_line(f"rm -f {tmp}")
-        for chunk in chunks:
-            con.send_line(f"printf '%s' '{chunk}' >> {tmp}")
-            time.sleep(0.08)
-        expected = str(len(payload))
-        con.send_line(f"echo SZ$(wc -c <{tmp})Z")
-        ok, _ = con.read_until(f"SZ{expected}Z".encode(), timeout)
-        if not ok:
-            raise RuntimeError(f"upload size mismatch (want {expected} base64 bytes) - {path}")
+    # Each step below is its OWN connection -- see module docstring. This
+    # costs a reconnect per chunk (noticeably slower than one persistent
+    # session would be), but a persistent session is not reliable here.
+    exec_once(host, port, f"rm -f {tmp}", timeout)
+    for chunk in chunks:
+        exec_once(host, port, f"printf '%s' '{chunk}' >> {tmp}", timeout)
 
-        if mode is not None:
-            con.send_line(
-                f"base64 -d {tmp} > {path} && chmod {mode:o} {path} && rm -f {tmp}; echo DC$?DC"
-            )
-        else:
-            con.send_line(f"base64 -d {tmp} > {path} && rm -f {tmp}; echo DC$?DC")
-        ok, out = con.read_until(b"DC0DC", timeout)
-        if not ok:
-            raise RuntimeError(f"decode to {path} failed; stream tail: {out[-160:]!r}")
+    expected = str(len(payload))
+    out = exec_once(host, port, f"wc -c <{tmp}", timeout)
+    if expected not in out:
+        raise RuntimeError(f"upload size mismatch (want {expected} base64 bytes, got {out!r}) - {path}")
 
-        con.send_line(f"echo WD$(wc -c <{path})W")
-        ok, out = con.read_until(f"WD{len(content)}W".encode(), timeout)
-        if not ok:
-            raise RuntimeError(f"after-write size check failed for {path} - {out[-120:]}")
+    decode_cmd = f"base64 -d {tmp} > {path} && rm -f {tmp}"
+    if mode is not None:
+        decode_cmd = f"base64 -d {tmp} > {path} && chmod {mode:o} {path} && rm -f {tmp}"
+    exec_once(host, port, decode_cmd, timeout)
+
+    out = exec_once(host, port, f"wc -c <{path}", timeout)
+    if str(len(content)) not in out:
+        raise RuntimeError(f"after-write size check failed for {path} - got {out!r}")
 
     return f"written {path}: {len(content)} bytes" + (f" (mode {mode:o})" if mode else "")
 
@@ -180,20 +216,10 @@ def pull_file(host: str, port: int, path: str, timeout: float = 60.0) -> str:
     """Reads ``path`` through a console session (any path, /root included).
     The node base64-encodes the file into one output line, so binary
     content survives the transport; the caller receives the decoded text."""
-    with Console(host, port) as con:
-        con.drain()
-        tag = f"PL{time.time_ns() % 937:03d}"
-        con.buf = b""
-        con.send_line(f"base64 -w0 {path} 2>/dev/null; echo {tag}$?{tag}")
-        ok, out = con.read_until((tag + "0" + tag).encode(), timeout)
-        if not ok:
-            raise RuntimeError(f"read of {path} timed out - partial stream tail: {out[-160:]!r}")
-
-        body = _ANSI_RE.sub("", out).split("\n", 1)[-1]
-        body = body[: body.rfind(tag)]
-        # bracketed-paste toggles (esc[?2004l) ride along inside long output
-        # echo - without stripping them the payload misaligns
-        payload = "".join(body.split())
-        if not payload:
-            raise RuntimeError(f"{path} unreadable or empty on the node")
-        return base64.b64decode(payload).decode()
+    out = exec_once(host, port, f"base64 -w0 {path} 2>/dev/null", timeout)
+    # bracketed-paste toggles (esc[?2004l) ride along inside long output
+    # echo -- without stripping them the payload misaligns
+    payload = "".join(out.split())
+    if not payload:
+        raise RuntimeError(f"{path} unreadable or empty on the node")
+    return base64.b64decode(payload).decode()

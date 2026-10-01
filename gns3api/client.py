@@ -299,11 +299,36 @@ class Gns3Client:
                 return
         raise Gns3ApiError(500, "node did not reach started state", "POST", "start")
 
+    def _console_retry(self, fn, *, retries: int = 2, delay: float = 1.5):
+        # The console is a raw telnet socket proxied by the GNS3 compute --
+        # unlike the REST layer (_send_with_retry), a mid-session reset here
+        # previously had no recovery at all. Observed in practice (not
+        # image-specific: reproduces on both alpinet and debinet consoles)
+        # as a ConnectionResetError/BrokenPipeError on the *second* send on
+        # an otherwise healthy connection. Retrying the whole operation on a
+        # fresh connection clears it. push_file/pull_file raise RuntimeError
+        # (not a connection-level exception) for a corrupted/incomplete
+        # transfer, which the same underlying reset also causes -- those are
+        # just as retriable.
+        last_error: Exception = RuntimeError("no attempt made")
+        for attempt in range(retries + 1):
+            try:
+                return fn()
+            except (ConnectionError, OSError, RuntimeError) as exc:
+                last_error = exc
+                if attempt < retries:
+                    time.sleep(delay)
+        raise Gns3ApiError(500, f"console operation failed after retries: {last_error}", "CONSOLE", "")
+
     def console_exec(self, project_id: str, node_id: str, command: str, timeout: float = 30.0) -> str:
         self._ensure_node_running(project_id, node_id)
-        host, port = self.get_console(project_id, node_id)
-        with Console(host, port) as con:
-            return con.exec(command, timeout=timeout)
+
+        def attempt():
+            host, port = self.get_console(project_id, node_id)
+            with Console(host, port) as con:
+                return con.exec(command, timeout=timeout)
+
+        return self._console_retry(attempt)
 
     def push_node_file(
         self, project_id: str, node_id: str, path: str, content: str,
@@ -313,8 +338,12 @@ class Gns3Client:
         # and any other path, at the cost of the node being started and the
         # file arriving as base64 chunks through the PTY.
         self._ensure_node_running(project_id, node_id)
-        host, port = self.get_console(project_id, node_id)
-        return push_file(host, port, path, content, mode=mode, timeout=timeout)
+
+        def attempt():
+            host, port = self.get_console(project_id, node_id)
+            return push_file(host, port, path, content, mode=mode, timeout=timeout)
+
+        return self._console_retry(attempt)
 
     def pull_node_file(self, project_id: str, node_id: str, path: str,
                        timeout: float = 60.0) -> str:
@@ -322,8 +351,12 @@ class Gns3Client:
         # for every path including /root (the files API 404s there). The
         # transfer is base64 so binary content stays intact.
         self._ensure_node_running(project_id, node_id)
-        host, port = self.get_console(project_id, node_id)
-        return pull_file(host, port, path, timeout=timeout)
+
+        def attempt():
+            host, port = self.get_console(project_id, node_id)
+            return pull_file(host, port, path, timeout=timeout)
+
+        return self._console_retry(attempt)
 
     # -- idempotent builders ----------------------------------------------------
     def ensure_node(
