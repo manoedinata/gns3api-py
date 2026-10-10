@@ -15,7 +15,7 @@ from typing import Any, Optional
 
 import requests
 
-from .console import Console, pull_file, push_file
+from .console import Console, WsConsole, pull_file, push_file, ws_pull_file, ws_push_file
 from .exceptions import Gns3ApiError
 
 
@@ -259,6 +259,21 @@ class Gns3Client:
             node = self.get_node(project_id, node_id)
         return self.console_endpoint(node)
 
+    def get_console_ws_url(self, project_id: str, node_id: str) -> str:
+        """Builds the controller's console websocket URL for a node -- the
+        `WsConsole` counterpart of `get_console()`. Unlike `get_console()`,
+        this needs no console host/port resolution: the controller proxies
+        the console itself, so only its own base URL (scheme/host/port)
+        must be reachable from here, not the compute's console TCP port."""
+        try:
+            self.get_node(project_id, node_id)
+        except Gns3ApiError:
+            self.open_project(project_id)
+        self._ensure_auth()
+        parsed = urlparse(self.base_url)
+        scheme = "wss" if parsed.scheme == "https" else "ws"
+        return f"{scheme}://{parsed.netloc}/v3/projects/{project_id}/nodes/{node_id}/console/ws?token={self._token}"
+
     # -- node files -------------------------------------------------------------
     def read_node_file(self, project_id: str, node_id: str, path: str) -> str:
         # Works for controller-managed paths such as /etc/network/interfaces;
@@ -320,10 +335,17 @@ class Gns3Client:
                     time.sleep(delay)
         raise Gns3ApiError(500, f"console operation failed after retries: {last_error}", "CONSOLE", "")
 
-    def console_exec(self, project_id: str, node_id: str, command: str, timeout: float = 30.0) -> str:
+    def console_exec(
+        self, project_id: str, node_id: str, command: str, timeout: float = 30.0,
+        transport: str = "telnet",
+    ) -> str:
         self._ensure_node_running(project_id, node_id)
 
         def attempt():
+            if transport == "websocket":
+                url = self.get_console_ws_url(project_id, node_id)
+                with WsConsole(url, verify=self.verify) as con:
+                    return con.exec(command, timeout=timeout)
             host, port = self.get_console(project_id, node_id)
             with Console(host, port) as con:
                 return con.exec(command, timeout=timeout)
@@ -333,26 +355,37 @@ class Gns3Client:
     def push_node_file(
         self, project_id: str, node_id: str, path: str, content: str,
         mode: int | None = None, timeout: float = 120.0,
+        transport: str = "telnet",
     ) -> str:
         # Console-channel write: unlike write_node_file this reaches /root
         # and any other path, at the cost of the node being started and the
-        # file arriving as base64 chunks through the PTY.
+        # file arriving as base64 chunks through the PTY. transport="websocket"
+        # tunnels that same channel through the controller's console
+        # websocket instead of a direct telnet socket to the compute -- use
+        # it when only the controller's HTTP(S) port is reachable from here.
         self._ensure_node_running(project_id, node_id)
 
         def attempt():
+            if transport == "websocket":
+                url = self.get_console_ws_url(project_id, node_id)
+                return ws_push_file(url, path, content, mode=mode, timeout=timeout, verify=self.verify)
             host, port = self.get_console(project_id, node_id)
             return push_file(host, port, path, content, mode=mode, timeout=timeout)
 
         return self._console_retry(attempt)
 
     def pull_node_file(self, project_id: str, node_id: str, path: str,
-                       timeout: float = 60.0) -> str:
+                       timeout: float = 60.0, transport: str = "telnet") -> str:
         # Console-channel read: the counterpart of push_node_file, working
         # for every path including /root (the files API 404s there). The
-        # transfer is base64 so binary content stays intact.
+        # transfer is base64 so binary content stays intact. See
+        # push_node_file() for what transport="websocket" changes.
         self._ensure_node_running(project_id, node_id)
 
         def attempt():
+            if transport == "websocket":
+                url = self.get_console_ws_url(project_id, node_id)
+                return ws_pull_file(url, path, timeout=timeout, verify=self.verify)
             host, port = self.get_console(project_id, node_id)
             return pull_file(host, port, path, timeout=timeout)
 

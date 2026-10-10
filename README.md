@@ -108,6 +108,28 @@ checked for you.
 out = client.console_exec(project_id, node_id, "hostname; uptime")
 ```
 
+### Console over websocket (no direct compute port needed)
+
+By default, `console_exec()`/`push_node_file()`/`pull_node_file()` connect
+with a raw telnet socket to the compute's console TCP port (resolved via
+`get_console()`). If that port isn't reachable from where this code runs
+-- e.g. a remote controller behind NAT or a firewall that only exposes its
+HTTP(S) port -- pass `transport="websocket"` instead: the controller
+proxies the exact same console byte stream over a websocket at
+`/v3/projects/{project_id}/nodes/{node_id}/console/ws`, so only the
+controller's own base URL needs to be reachable.
+
+```python
+out = client.console_exec(project_id, node_id, "hostname; uptime", transport="websocket")
+client.push_node_file(project_id, node_id, "/root/init.sh", script_text, transport="websocket")
+```
+
+`gns3api.console` also exposes the websocket primitives directly --
+`WsConsole` (the `Console` counterpart), and `ws_exec_once`/`ws_push_file`/
+`ws_pull_file`/`ws_pull_file_chunked`, each taking the console websocket
+URL (`client.get_console_ws_url(project_id, node_id)`) instead of a
+`(host, port)` pair.
+
 ## Pushing arbitrary files over the console
 
 `push_node_file()` writes any file to any path, /root included - the files
@@ -139,7 +161,11 @@ file injection (`read/write_node_file`), console endpoint resolution
 (`get_console`, `console_endpoint`), console shell execution
 (`console_exec`), console-channel file transfer (`push_node_file`,
 `pull_node_file`, chunked variant `pull_file_chunked` in
-[`gns3api/console.py`](gns3api/console.py)), and the
+[`gns3api/console.py`](gns3api/console.py)), an alternate websocket
+transport for all of the above (`transport="websocket"`, backed by
+`WsConsole`/`ws_exec_once`/`ws_push_file`/`ws_pull_file`/
+`ws_pull_file_chunked` in [`gns3api/console.py`](gns3api/console.py) and
+`get_console_ws_url`), and the
 idempotent builders (`ensure_node`, `ensure_link`). See
 [`gns3api/client.py`](gns3api/client.py) for the full method list, or the
 server's `/docs` and `/openapi.json` for the complete API surface.
