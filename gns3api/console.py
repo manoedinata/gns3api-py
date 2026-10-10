@@ -422,14 +422,19 @@ def ws_pull_file_chunked(
 def ws_interactive(url: str, verify: bool = True, escape_char: bytes = b"\x1d") -> None:
     """Drops the local terminal into a live, raw session on a console
     websocket -- the same byte stream xterm.js/websocat render directly
-    (shell prompt, ANSI colors, line editing all intact). This is the
-    counterpart to `WsConsole.exec()`'s scripted automation (one command per
-    connection, IAC/ANSI stripped, correctness-checked with markers): here,
-    a single connection stays open for the whole session and bytes pass
-    through completely unprocessed in both directions, same as any plain
-    telnet/websocat client. The "one command per connection" reset that
-    `exec()` works around is specific to that scripted marker exchange --
-    it does not apply to an organic interactive session like this one.
+    (shell prompt, ANSI colors, line editing all intact), minus telnet IAC
+    option-negotiation bytes (``_strip_iac_filter``): those are protocol
+    framing a real telnet client would consume silently, never display, so
+    stripping them is not "processing" the session output -- it's the same
+    byte stream, just without the control-channel noise mixed into it
+    (otherwise every session opens with a few bytes of garbage while the
+    compute's telnetd negotiates options). This is the counterpart to
+    `WsConsole.exec()`'s scripted automation (one command per connection,
+    ANSI stripped too, correctness-checked with markers): here, a single
+    connection stays open for the whole session, and nothing beyond IAC
+    bytes is touched. The "one command per connection" reset that `exec()`
+    works around is specific to that scripted marker exchange -- it does
+    not apply to an organic interactive session like this one.
 
     Puts fd 0 in raw mode (so arrow keys, Ctrl-C, etc. reach the remote
     shell instead of the local terminal driver) and restores it on exit.
@@ -440,6 +445,7 @@ def ws_interactive(url: str, verify: bool = True, escape_char: bytes = b"\x1d") 
 
     fd = sys.stdin.fileno()
     old_attrs = termios.tcgetattr(fd)
+    pending = b""
     try:
         tty.setraw(fd)
         while True:
@@ -458,7 +464,9 @@ def ws_interactive(url: str, verify: bool = True, escape_char: bytes = b"\x1d") 
                     break
                 if isinstance(data, str):
                     data = data.encode()
-                os.write(sys.stdout.fileno(), data)
+                clean, pending = _strip_iac_filter(data, pending)
+                if clean:
+                    os.write(sys.stdout.fileno(), clean)
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
         try:
