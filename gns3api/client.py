@@ -15,7 +15,7 @@ from typing import Any, Optional
 
 import requests
 
-from .console import Console, WsConsole, pull_file, push_file, ws_pull_file, ws_push_file
+from .console import Console, WsConsole, pull_file, push_file, ws_interactive, ws_pull_file, ws_push_file
 from .exceptions import Gns3ApiError
 
 
@@ -297,7 +297,7 @@ class Gns3Client:
             headers={"Content-Type": "application/octet-stream"},
         )
 
-    def _ensure_node_running(self, project_id: str, node_id: str, wait: int = 90) -> None:
+    def ensure_node_running(self, project_id: str, node_id: str, wait: int = 90) -> None:
         # A stopped node has no listening console; start and wait before
         # attempting any console session.
         node = self.get_node(project_id, node_id)
@@ -339,7 +339,7 @@ class Gns3Client:
         self, project_id: str, node_id: str, command: str, timeout: float = 30.0,
         transport: str = "telnet",
     ) -> str:
-        self._ensure_node_running(project_id, node_id)
+        self.ensure_node_running(project_id, node_id)
 
         def attempt():
             if transport == "websocket":
@@ -363,7 +363,7 @@ class Gns3Client:
         # tunnels that same channel through the controller's console
         # websocket instead of a direct telnet socket to the compute -- use
         # it when only the controller's HTTP(S) port is reachable from here.
-        self._ensure_node_running(project_id, node_id)
+        self.ensure_node_running(project_id, node_id)
 
         def attempt():
             if transport == "websocket":
@@ -380,7 +380,7 @@ class Gns3Client:
         # for every path including /root (the files API 404s there). The
         # transfer is base64 so binary content stays intact. See
         # push_node_file() for what transport="websocket" changes.
-        self._ensure_node_running(project_id, node_id)
+        self.ensure_node_running(project_id, node_id)
 
         def attempt():
             if transport == "websocket":
@@ -390,6 +390,17 @@ class Gns3Client:
             return pull_file(host, port, path, timeout=timeout)
 
         return self._console_retry(attempt)
+
+    def open_console(self, project_id: str, node_id: str) -> None:
+        """Drops the calling terminal into a live, raw session on the
+        node's console over the controller's websocket proxy -- see
+        `gns3api.console.ws_interactive` for what "raw" means here (nothing
+        short of the exact byte stream xterm.js/websocat would show).
+        Blocks until the user disconnects (Ctrl-]) or the remote end closes
+        the connection."""
+        self.ensure_node_running(project_id, node_id)
+        url = self.get_console_ws_url(project_id, node_id)
+        ws_interactive(url, verify=self.verify)
 
     # -- idempotent builders ----------------------------------------------------
     def ensure_node(

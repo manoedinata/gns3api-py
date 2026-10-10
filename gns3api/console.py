@@ -29,10 +29,15 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import os
 import re
+import select
 import socket
 import ssl
+import sys
+import termios
 import time
+import tty
 
 import websocket
 
@@ -412,3 +417,51 @@ def ws_pull_file_chunked(
 ) -> str:
     """`pull_file_chunked`'s websocket counterpart; see `WsConsole`."""
     return _pull_file_chunked(lambda cmd, t: ws_exec_once(url, cmd, t, verify=verify), path, timeout, page)
+
+
+def ws_interactive(url: str, verify: bool = True, escape_char: bytes = b"\x1d") -> None:
+    """Drops the local terminal into a live, raw session on a console
+    websocket -- the same byte stream xterm.js/websocat render directly
+    (shell prompt, ANSI colors, line editing all intact). This is the
+    counterpart to `WsConsole.exec()`'s scripted automation (one command per
+    connection, IAC/ANSI stripped, correctness-checked with markers): here,
+    a single connection stays open for the whole session and bytes pass
+    through completely unprocessed in both directions, same as any plain
+    telnet/websocat client. The "one command per connection" reset that
+    `exec()` works around is specific to that scripted marker exchange --
+    it does not apply to an organic interactive session like this one.
+
+    Puts fd 0 in raw mode (so arrow keys, Ctrl-C, etc. reach the remote
+    shell instead of the local terminal driver) and restores it on exit.
+    Escape with Ctrl-] (``escape_char``) to disconnect.
+    """
+    sslopt = {"cert_reqs": ssl.CERT_NONE} if not verify else None
+    ws = websocket.create_connection(url, sslopt=sslopt, skip_utf8_validation=True)
+
+    fd = sys.stdin.fileno()
+    old_attrs = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        while True:
+            readable, _, _ = select.select([fd, ws.sock], [], [], 0.05)
+            if fd in readable:
+                data = os.read(fd, 4096)
+                if not data or escape_char in data:
+                    break
+                ws.send(data, opcode=websocket.ABNF.OPCODE_TEXT)
+            if ws.sock in readable:
+                try:
+                    opcode, data = ws.recv_data()
+                except (websocket.WebSocketConnectionClosedException, OSError, ssl.SSLError):
+                    break
+                if opcode == websocket.ABNF.OPCODE_CLOSE:
+                    break
+                if isinstance(data, str):
+                    data = data.encode()
+                os.write(sys.stdout.fileno(), data)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+        try:
+            ws.close()
+        except Exception:
+            pass
