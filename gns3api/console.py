@@ -442,6 +442,13 @@ def ws_interactive(url: str, verify: bool = True, escape_char: bytes = b"\x1d") 
     """
     sslopt = {"cert_reqs": ssl.CERT_NONE} if not verify else None
     ws = websocket.create_connection(url, sslopt=sslopt, skip_utf8_validation=True)
+    # TLS can decrypt several already-arrived frames into its own buffer in
+    # one shot; select() below only sees the (by then empty) kernel socket
+    # buffer, not that backlog. A short socket timeout lets the drain loop
+    # keep calling recv_data() until it's actually empty instead of reading
+    # one frame per select() wakeup and leaving the rest stuck until some
+    # unrelated later byte nudges select() again.
+    ws.settimeout(0.02)
 
     fd = sys.stdin.fileno()
     old_attrs = termios.tcgetattr(fd)
@@ -455,18 +462,27 @@ def ws_interactive(url: str, verify: bool = True, escape_char: bytes = b"\x1d") 
                 if not data or escape_char in data:
                     break
                 ws.send(data, opcode=websocket.ABNF.OPCODE_TEXT)
-            if ws.sock in readable:
+            if ws.sock not in readable:
+                continue
+            closed = False
+            while True:
                 try:
                     opcode, data = ws.recv_data()
+                except websocket.WebSocketTimeoutException:
+                    break
                 except (websocket.WebSocketConnectionClosedException, OSError, ssl.SSLError):
+                    closed = True
                     break
                 if opcode == websocket.ABNF.OPCODE_CLOSE:
+                    closed = True
                     break
                 if isinstance(data, str):
                     data = data.encode()
                 clean, pending = _strip_iac_filter(data, pending)
                 if clean:
                     os.write(sys.stdout.fileno(), clean)
+            if closed:
+                break
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
         try:
