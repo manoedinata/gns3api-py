@@ -9,6 +9,36 @@ GNS3 v2 API (HTTP Basic Auth, `/v2` prefix) that older clients such as
 with a v3 controller. This library talks to the v3 API directly, based on
 the server's own OpenAPI spec (`/openapi.json`).
 
+## Features
+
+- **Projects** - list/get/find/create/open/close/delete.
+- **Nodes** - list/get/find/create/update/delete; start/stop/suspend/reload
+  (one node or all); `ensure_node_running` auto-starts a stopped node and
+  waits for it to come up.
+- **Links** - list/create/delete.
+- **Templates** - list/find, create a node from a template.
+- **File injection** - `read_node_file`/`write_node_file` for
+  controller-managed paths (e.g. `/etc/network/interfaces`);
+  `push_node_file`/`pull_node_file` over the console for any path
+  including `/root`, plus `pull_file_chunked` for large files.
+- **Console command execution** - `console_exec` runs one shell command on
+  a node and returns its output, without opening an interactive session.
+- **Live interactive console** - `open_console` drops the calling terminal
+  into a real, raw session on a node's console: the same byte stream
+  xterm.js or `websocat` would show (live shell prompt, ANSI colors,
+  Ctrl-C reaches the remote shell), not a scripted command/response loop.
+- **Two console transports** - everything console-related works over a
+  direct telnet socket to the compute (`transport="telnet"`, the default)
+  or through the controller's own websocket proxy (`transport="websocket"`)
+  for when only the controller's HTTP(S) port is reachable (e.g. a remote
+  controller behind NAT/a firewall).
+- **Idempotent builders** - `ensure_node` (create, or reconcile an
+  existing node) and `ensure_link` (skip if the same wiring already
+  exists), for scripts that can be re-run safely.
+- **Resilient by default** - lazy JWT auth with transparent re-login on a
+  `401`, retry on transient connection drops, and retry on a console reset
+  (see [`gns3api/console.py`](gns3api/console.py) for why that happens).
+
 ## Install
 
 ```bash
