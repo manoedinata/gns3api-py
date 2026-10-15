@@ -47,6 +47,13 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
 # PTY line limit on debinet-style consoles
 CHUNK_SIZE = 120
 
+# sent on every REST and websocket request so traffic looks like a regular
+# browser instead of python-requests/websocket-client defaults
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
+)
+
 
 def _strip_iac_filter(data: bytes, pending: bytes) -> tuple[bytes, bytes]:
     """Removes telnet IAC sequences; caller keeps the unterminated tail."""
@@ -231,7 +238,9 @@ class WsConsole(_ConsoleBase):
 
     def connect(self) -> "WsConsole":
         sslopt = {"cert_reqs": ssl.CERT_NONE} if not self.verify else None
-        self.ws = websocket.create_connection(self.url, timeout=self.timeout, sslopt=sslopt)
+        self.ws = websocket.create_connection(
+            self.url, timeout=self.timeout, sslopt=sslopt, header=[f"User-Agent: {USER_AGENT}"]
+        )
         self.ws.settimeout(0.2)
         return self
 
@@ -441,7 +450,9 @@ def ws_interactive(url: str, verify: bool = True, escape_char: bytes = b"\x1d") 
     Escape with Ctrl-] (``escape_char``) to disconnect.
     """
     sslopt = {"cert_reqs": ssl.CERT_NONE} if not verify else None
-    ws = websocket.create_connection(url, sslopt=sslopt, skip_utf8_validation=True)
+    ws = websocket.create_connection(
+        url, sslopt=sslopt, skip_utf8_validation=True, header=[f"User-Agent: {USER_AGENT}"]
+    )
     # TLS can decrypt several already-arrived frames into its own buffer in
     # one shot; select() below only sees the (by then empty) kernel socket
     # buffer, not that backlog. A short socket timeout lets the drain loop

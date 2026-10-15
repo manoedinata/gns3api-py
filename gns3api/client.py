@@ -15,7 +15,7 @@ from typing import Any, Optional
 
 import requests
 
-from .console import Console, WsConsole, pull_file, push_file, ws_interactive, ws_pull_file, ws_push_file
+from .console import USER_AGENT, Console, WsConsole, pull_file, push_file, ws_interactive, ws_pull_file, ws_push_file
 from .exceptions import Gns3ApiError
 
 
@@ -25,9 +25,14 @@ class Gns3Client:
         self.username = username
         self.password = password
         self.verify = verify
-        self.session = requests.Session()
-        self.session.verify = verify
+        self.session = self._new_session()
         self._token: Optional[str] = None
+
+    def _new_session(self) -> requests.Session:
+        session = requests.Session()
+        session.verify = self.verify
+        session.headers["User-Agent"] = USER_AGENT
+        return session
 
     @classmethod
     def from_creds_file(cls, path: str | Path, verify: bool = False) -> "Gns3Client":
@@ -79,8 +84,7 @@ class Gns3Client:
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
                 last_error = exc
                 self.session.close()
-                self.session = requests.Session()
-                self.session.verify = self.verify
+                self.session = self._new_session()
                 if self._token is not None:
                     self.session.headers["Authorization"] = f"Bearer {self._token}"
                 time.sleep(0.5 * (attempt + 1))
