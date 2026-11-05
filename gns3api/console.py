@@ -136,6 +136,25 @@ class _ConsoleBase:
         self.buf = buf
         return False, buf.decode(errors="replace")
 
+    def read_until_re(self, pattern: "re.Pattern[bytes]", timeout: float):
+        """Regex counterpart of ``read_until``: waits for ``pattern`` in the
+        stream; returns (match or None, text so far)."""
+        deadline = time.time() + timeout
+        buf = self.buf
+        while time.time() < deadline:
+            m = pattern.search(buf)
+            if m:
+                consumed, rest = buf[: m.end()], buf[m.end():]
+                self.buf = rest
+                return m, consumed.decode(errors="replace")
+            try:
+                buf += self._recv()
+            except ConnectionError:
+                self.buf = buf
+                return None, buf.decode(errors="replace")
+        self.buf = buf
+        return None, buf.decode(errors="replace")
+
     def _passive_drain(self, timeout: float = 0.4) -> None:
         """Clears a stale session banner WITHOUT sending anything -- an
         active probe command would itself consume this connection's one
@@ -152,18 +171,26 @@ class _ConsoleBase:
     def exec(self, command: str, timeout: float = 30.0) -> str:
         """Runs one shell command on a freshly-connected console and returns
         its output (echoed command line and completion marker both
-        stripped). This must be the ONLY command sent on this connection
-        (see module docstring) -- callers needing several commands should
-        open a new console (or use `exec_once`/`ws_exec_once`) per command."""
+        stripped), for ANY exit code. This must be the ONLY command sent on
+        this connection (see module docstring) -- callers needing several
+        commands should open a new console (or use `exec_once`/
+        `ws_exec_once`) per command."""
         self._passive_drain()
         tag = f"X{time.time_ns() % 937:03d}"
         self.send_line(f"{command}; echo {tag}$?{tag}")
-        ok, out = self.read_until((tag + "0" + tag).encode(), timeout)
-        if not ok:
-            # read_until() swallows a mid-stream ConnectionError and returns
-            # whatever partial output it had -- surface that as a failure
-            # instead of handing the caller silently-truncated output, so a
-            # retry wrapper (e.g. Gns3Client._console_retry) can catch it.
+        # the exit code is unknown until the command finishes: match
+        # {tag}{digits}{tag} -- waiting for a hardcoded rc=0 marker left
+        # every non-zero exit (cat on a missing path, pidof miss, SQL
+        # errors...) hanging until timeout despite having completed
+        marker = re.compile(
+            (re.escape(tag) + r"\d+" + re.escape(tag)).encode())
+        m, out = self.read_until_re(marker, timeout)
+        if m is None:
+            # read_until_re() swallows a mid-stream ConnectionError and
+            # returns whatever partial output it had -- surface that as a
+            # failure instead of handing the caller silently-truncated
+            # output, so a retry wrapper (e.g. Gns3Client._console_retry)
+            # can catch it.
             raise ConnectionError(
                 f"exec({command!r}) did not complete within {timeout}s - stream tail: {out[-160:]!r}"
             )
