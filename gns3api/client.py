@@ -119,6 +119,9 @@ class Gns3Client:
         raise last_error
 
     # -- low level --------------------------------------------------------
+    # status codes retried below; 408/504 only for idempotent verbs
+    _RETRYABLE_CODES = {408, 504}
+
     def _request(self, method: str, path: str, retries: int = 3, raw: bool = False, **kwargs) -> Any:
         if self.delay_range:
             time.sleep(random.uniform(*self.delay_range))
@@ -128,6 +131,17 @@ class Gns3Client:
         if resp.status_code == 401 and self._token is not None:
             # token may have expired; retry once after re-authenticating
             self.authenticate()
+            resp = self._send_with_retry(method, url, retries, **kwargs)
+        # 409 from project open means "Project is closing, please try
+        # again in a few seconds" (gns3-server raises it verbatim from a
+        # locked open(); the request never took effect, so any verb is
+        # safe to retry). 408/504 are the controller<->compute timeout
+        # class: retry those only on idempotent verbs, since a timed-out
+        # POST may still have taken effect server-side.
+        retryable_409 = resp.status_code == 409 and "closing" in resp.text.lower()
+        retryable_timeout = resp.status_code in self._RETRYABLE_CODES and method in ("GET", "PUT", "HEAD", "OPTIONS")
+        if retryable_409 or retryable_timeout:
+            time.sleep(1.0 * random.uniform(0.5, 1.5))
             resp = self._send_with_retry(method, url, retries, **kwargs)
         if not resp.ok:
             try:
