@@ -36,8 +36,11 @@ the server's own OpenAPI spec (`/openapi.json`).
   existing node) and `ensure_link` (skip if the same wiring already
   exists), for scripts that can be re-run safely.
 - **Resilient by default** - lazy JWT auth with transparent re-login on a
-  `401`, retry on transient connection drops, and retry on a console reset
-  (see [`gns3api/console.py`](gns3api/console.py) for why that happens).
+  `401`, retry with jittered backoff on transient connection drops, retry
+  on a console reset (see [`gns3api/console.py`](gns3api/console.py) for
+  why that happens) and on a rejected websocket console handshake (a stale
+  JWT is dropped and re-acquired), bounded HTTP timeouts, and automatic
+  open-and-retry when an operation hits a closed project.
 
 ## Install
 
@@ -63,7 +66,32 @@ client.start_all_nodes(project["project_id"])
 
 Authentication is lazy: the first API call triggers a login and caches the
 bearer token, and a `401` response transparently re-authenticates and
-retries once.
+retries once. All controller errors, a failed login included, raise
+`Gns3ApiError`.
+
+## Request pacing and timeouts
+
+```python
+client = Gns3Client(
+    base_url="http://<gns3-host>:80",
+    username="...",
+    password="...",
+    delay_range=(0.5, 1.5),
+    timeout=(10, 60),
+)
+```
+
+- `delay_range=(min, max)` sleeps a uniformly random interval, in
+  seconds, before every REST request, so calls arrive spaced out instead
+  of in a tight loop. `None` (the default) adds no delay at all.
+- `timeout=(connect, read)` bounds every HTTP request. The GNS3 server
+  imposes no HTTP timeout of its own (node operations budget 240s
+  internally, file writes run unbounded), so without a client-side
+  timeout a wedged controller hangs a call forever. Raise the read side
+  for legitimately slow operations such as large `write_node_file`
+  transfers.
+
+Both parameters are also accepted by `Gns3Client.from_creds_file()`.
 
 ## File injection into nodes
 
@@ -128,8 +156,8 @@ and returns the cleaned output. The transport handles the telnet IAC
 negotiation sequences that GNS3 consoles emit and drains a fresh session's
 boot banner passively on connect. Each command runs on its own connection
 (the console server tolerates exactly one outbound line per connection),
-verified with a unique completion marker, and `Gns3Client` transparently
-retries on a reset. Both
+verified with a unique completion marker that matches any
+exit code, and `Gns3Client` transparently retries on a reset. Both
 `console_exec()` and `push_node_file()` resolve the endpoint through
 `get_console()` internals, so the project is opened and the node state is
 checked for you.
