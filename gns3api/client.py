@@ -8,6 +8,7 @@ server's own OpenAPI spec (`/openapi.json`).
 """
 from __future__ import annotations
 
+import random
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -20,11 +21,21 @@ from .exceptions import Gns3ApiError
 
 
 class Gns3Client:
-    def __init__(self, base_url: str, username: str, password: str, verify: bool = False):
+    def __init__(
+        self,
+        base_url: str,
+        username: str,
+        password: str,
+        verify: bool = False,
+        delay_range: Optional[tuple[float, float]] = None,
+    ):
         self.base_url = base_url.rstrip("/")
         self.username = username
         self.password = password
         self.verify = verify
+        # optional random pause (uniform, seconds) before every REST request,
+        # e.g. (0.5, 1.5); None (default) adds no delay
+        self.delay_range = delay_range
         self.session = self._new_session()
         self._token: Optional[str] = None
 
@@ -35,7 +46,12 @@ class Gns3Client:
         return session
 
     @classmethod
-    def from_creds_file(cls, path: str | Path, verify: bool = False) -> "Gns3Client":
+    def from_creds_file(
+        cls,
+        path: str | Path,
+        verify: bool = False,
+        delay_range: Optional[tuple[float, float]] = None,
+    ) -> "Gns3Client":
         """Builds a client from a simple "Key: Value" creds file (e.g. a
         course project's gitignored creds.txt), reading whichever of
         "GNS3 IP"/"GNS 3 IP", "Username" and "Password" it finds (match is
@@ -55,7 +71,7 @@ class Gns3Client:
             raise ValueError(f"{path}: missing {', '.join(missing)}")
 
         base_url = host if "://" in host else f"http://{host}"
-        return cls(base_url, username, password, verify=verify)
+        return cls(base_url, username, password, verify=verify, delay_range=delay_range)
 
     # -- auth -----------------------------------------------------------
     def authenticate(self) -> str:
@@ -92,6 +108,8 @@ class Gns3Client:
 
     # -- low level --------------------------------------------------------
     def _request(self, method: str, path: str, retries: int = 3, raw: bool = False, **kwargs) -> Any:
+        if self.delay_range:
+            time.sleep(random.uniform(*self.delay_range))
         self._ensure_auth()
         url = f"{self.base_url}{path}"
         resp = self._send_with_retry(method, url, retries, **kwargs)
