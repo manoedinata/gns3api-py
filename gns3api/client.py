@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 from typing import Any, Optional
 
 import requests
+import websocket
 
 from .console import USER_AGENT, Console, WsConsole, pull_file, push_file, ws_interactive, ws_pull_file, ws_push_file
 from .exceptions import Gns3ApiError
@@ -28,6 +29,7 @@ class Gns3Client:
         password: str,
         verify: bool = False,
         delay_range: Optional[tuple[float, float]] = None,
+        timeout: tuple[float, float] = (10.0, 60.0),
     ):
         self.base_url = base_url.rstrip("/")
         self.username = username
@@ -36,6 +38,11 @@ class Gns3Client:
         # optional random pause (uniform, seconds) before every REST request,
         # e.g. (0.5, 1.5); None (default) adds no delay
         self.delay_range = delay_range
+        # (connect, read) HTTP timeout in seconds; the GNS3 server imposes
+        # none of its own (node ops budget 240s internally, file writes are
+        # unbounded with timeout=None in the server source), so the client
+        # is the only line of defense against a wedged controller
+        self.timeout = timeout
         self.session = self._new_session()
         self._token: Optional[str] = None
 
@@ -51,6 +58,7 @@ class Gns3Client:
         path: str | Path,
         verify: bool = False,
         delay_range: Optional[tuple[float, float]] = None,
+        timeout: tuple[float, float] = (10.0, 60.0),
     ) -> "Gns3Client":
         """Builds a client from a simple "Key: Value" creds file (e.g. a
         course project's gitignored creds.txt), reading whichever of
@@ -71,15 +79,17 @@ class Gns3Client:
             raise ValueError(f"{path}: missing {', '.join(missing)}")
 
         base_url = host if "://" in host else f"http://{host}"
-        return cls(base_url, username, password, verify=verify, delay_range=delay_range)
+        return cls(base_url, username, password, verify=verify, delay_range=delay_range, timeout=timeout)
 
     # -- auth -----------------------------------------------------------
     def authenticate(self) -> str:
         resp = self.session.post(
             f"{self.base_url}/v3/access/users/login",
             data={"username": self.username, "password": self.password},
+            timeout=self.timeout,
         )
-        resp.raise_for_status()
+        if not resp.ok:
+            raise Gns3ApiError(resp.status_code, resp.text, "POST", "/v3/access/users/login")
         self._token = resp.json()["access_token"]
         self.session.headers["Authorization"] = f"Bearer {self._token}"
         return self._token
@@ -93,6 +103,7 @@ class Gns3Client:
         # after just one or two requests. Recreate the session (fresh TCP
         # connection) and retry on transient connection errors instead of
         # failing the whole call.
+        kwargs.setdefault("timeout", self.timeout)
         last_error: Exception = RuntimeError("no attempt made")
         for attempt in range(retries + 1):
             try:
@@ -103,7 +114,8 @@ class Gns3Client:
                 self.session = self._new_session()
                 if self._token is not None:
                     self.session.headers["Authorization"] = f"Bearer {self._token}"
-                time.sleep(0.5 * (attempt + 1))
+                if attempt < retries:
+                    time.sleep(0.5 * (attempt + 1) * random.uniform(0.5, 1.5))
         raise last_error
 
     # -- low level --------------------------------------------------------
@@ -254,6 +266,19 @@ class Gns3Client:
         )
 
     # -- consoles -------------------------------------------------------------
+    def _healed_project_call(self, fn, project_id: str):
+        # GNS3 returns 403 "The project is not opened" (NOT 409) for
+        # operations on a closed project -- verified in gns3-server's
+        # open_required decorator. Heal by opening, then retry once; a
+        # genuine permission 403 fails the retry identically and surfaces.
+        try:
+            return fn()
+        except Gns3ApiError as exc:
+            if exc.status_code != 403:
+                raise
+            self.open_project(project_id)
+            return fn()
+
     def console_endpoint(self, node: dict) -> tuple[str, int]:
         # The nodes API reports console_host as a bind-all placeholder
         # ("0.0.0.0", "::", "127.0.0.1"); connecting to it targets the local
@@ -268,14 +293,10 @@ class Gns3Client:
         return host, port
 
     def get_console(self, project_id: str, node_id: str) -> tuple[str, int]:
-        # A closed project blocks node reads outright (403 "not opened") or,
-        # when half-open, returns stripped payloads without console fields;
-        # both states are healed by opening the project first.
-        try:
-            node = self.get_node(project_id, node_id)
-        except Gns3ApiError:
-            self.open_project(project_id)
-            node = self.get_node(project_id, node_id)
+        # A closed project blocks node reads (403 "not opened") or, when
+        # half-open, returns stripped payloads without console fields; both
+        # states are healed by opening the project first.
+        node = self._healed_project_call(lambda: self.get_node(project_id, node_id), project_id)
         if not node.get("console"):
             self.open_project(project_id)
             node = self.get_node(project_id, node_id)
@@ -287,10 +308,7 @@ class Gns3Client:
         this needs no console host/port resolution: the controller proxies
         the console itself, so only its own base URL (scheme/host/port)
         must be reachable from here, not the compute's console TCP port."""
-        try:
-            self.get_node(project_id, node_id)
-        except Gns3ApiError:
-            self.open_project(project_id)
+        self._healed_project_call(lambda: self.get_node(project_id, node_id), project_id)
         self._ensure_auth()
         parsed = urlparse(self.base_url)
         scheme = "wss" if parsed.scheme == "https" else "ws"
@@ -321,20 +339,43 @@ class Gns3Client:
 
     def ensure_node_running(self, project_id: str, node_id: str, wait: int = 90) -> None:
         # A stopped node has no listening console; start and wait before
-        # attempting any console session.
-        node = self.get_node(project_id, node_id)
+        # attempting any console session. start/stop return 204 with no
+        # state payload, so polling GET /nodes/{id} is the only way to
+        # observe progress (gns3-server's own budget per node op is 240s).
+        healed = False
+
+        def get_node_healed():
+            nonlocal healed
+            try:
+                return self.get_node(project_id, node_id)
+            except Gns3ApiError as exc:
+                if exc.status_code == 403 and not healed:
+                    # the project can be auto-closed under a long poll
+                    # (auto_close drops it 5s after the last notification
+                    # listener leaves); open it once and keep waiting
+                    healed = True
+                    self.open_project(project_id)
+                    return self.get_node(project_id, node_id)
+                raise
+
+        node = get_node_healed()
         if node.get("status") == "started":
             return
         self.start_node(project_id, node_id)
         deadline = time.time() + wait
         while time.time() < deadline:
             time.sleep(1)
-            if self.get_node(project_id, node_id).get("status") == "started":
+            if get_node_healed().get("status") == "started":
                 # debinet's boot runs /root/init.sh synchronously; give
                 # the resulting shell a settle window before console work
                 time.sleep(5)
                 return
-        raise Gns3ApiError(500, "node did not reach started state", "POST", "start")
+        raise Gns3ApiError(
+            500,
+            f"node did not reach started state within {wait}s "
+            "(server-side budget per node op is 240s; raise `wait` for slow images)",
+            "POST", "start",
+        )
 
     def _console_retry(self, fn, *, retries: int = 2, delay: float = 1.5):
         # The console is a raw telnet socket proxied by the GNS3 compute --
@@ -351,9 +392,15 @@ class Gns3Client:
         for attempt in range(retries + 1):
             try:
                 return fn()
-            except (ConnectionError, OSError, RuntimeError) as exc:
+            except (ConnectionError, OSError, RuntimeError, websocket.WebSocketException) as exc:
                 last_error = exc
                 if attempt < retries:
+                    if isinstance(exc, websocket.WebSocketException):
+                        # a rejected ws console handshake usually means the
+                        # JWT went stale (server closes auth failures at
+                        # connect time); dropping the token forces the next
+                        # attempt's get_console_ws_url() to log in fresh
+                        self._token = None
                     time.sleep(delay)
         raise Gns3ApiError(500, f"console operation failed after retries: {last_error}", "CONSOLE", "")
 
