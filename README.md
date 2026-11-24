@@ -93,6 +93,28 @@ client = Gns3Client(
 
 Both parameters are also accepted by `Gns3Client.from_creds_file()`.
 
+## Logging and verbosity
+
+The library is silent by default and never prints to stdout on its own.
+Pass `verbose=True` to attach a stdout handler for the `gns3api` logger -
+one INFO line per operation: authenticating, connection retries and
+backoff, re-authentication on `401`, closed-project healing, node
+start/stop waits, console exec, file pushes and pulls with progress.
+
+```python
+client = Gns3Client(base_url="http://<gns3-host>:80", username="...", password="...", verbose=True)
+```
+
+Per-request detail (`GET /v3/projects/x/nodes/y -> 200`), delay jitter
+amounts, per-chunk progress and poll states log at DEBUG. To get the full
+firehose (or route output elsewhere), use standard logging - the flag is
+just a convenience that configures the `gns3api` logger for you:
+
+```python
+import logging
+logging.basicConfig(level=logging.DEBUG)
+```
+
 ## File injection into nodes
 
 The files API is the mechanism to place configuration into a node's

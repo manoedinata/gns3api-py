@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import logging
 import os
 import re
 import select
@@ -41,7 +42,15 @@ import tty
 
 import websocket
 
+logger = logging.getLogger(__name__)
+
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
+
+
+def _log_trunc(text: str, limit: int = 60) -> str:
+    """Command text safe for a log line: file-transfer commands carry huge
+    base64 payloads that would flood the console otherwise."""
+    return text[:limit] + "..." if len(text) > limit else text
 
 # sized so that "printf '%s' '<chunk>'" stays under the ~255-byte canonical
 # PTY line limit on debinet-style consoles
@@ -175,6 +184,7 @@ class _ConsoleBase:
         this connection (see module docstring) -- callers needing several
         commands should open a new console (or use `exec_once`/
         `ws_exec_once`) per command."""
+        logger.debug("exec %r", _log_trunc(command, 80))
         self._passive_drain()
         tag = f"X{time.time_ns() % 937:03d}"
         self.send_line(f"{command}; echo {tag}$?{tag}")
@@ -218,6 +228,7 @@ class Console(_ConsoleBase):
     def connect(self) -> "Console":
         self.sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
         self.sock.settimeout(0.2)
+        logger.debug("console connected (telnet) %s:%s", self.host, self.port)
         return self
 
     def close(self) -> None:
@@ -269,6 +280,8 @@ class WsConsole(_ConsoleBase):
             self.url, timeout=self.timeout, sslopt=sslopt, header=[f"User-Agent: {USER_AGENT}"]
         )
         self.ws.settimeout(0.2)
+        # no URL in the log: the JWT token is embedded in the query string
+        logger.debug("console connected (websocket)")
         return self
 
     def close(self) -> None:
@@ -306,6 +319,7 @@ def exec_once(host: str, port: int, command: str, timeout: float = 30.0) -> str:
     """Opens a fresh telnet connection, runs exactly one command, closes.
     The building block for any multi-step console operation (see push_file/
     pull_file below) now that one connection only tolerates one command."""
+    logger.info("exec %r on %s:%s", _log_trunc(command), host, port)
     return _exec_once(lambda: Console(host, port), command, timeout)
 
 
@@ -313,6 +327,7 @@ def ws_exec_once(url: str, command: str, timeout: float = 30.0, verify: bool = T
     """`exec_once`'s websocket counterpart: opens a fresh console websocket
     (through the controller, see `WsConsole`) instead of a direct telnet
     socket."""
+    logger.info("exec %r via console websocket", _log_trunc(command))
     return _exec_once(lambda: WsConsole(url, verify=verify), command, timeout)
 
 
@@ -324,12 +339,14 @@ def _push_file(exec_fn, path: str, content: str, mode: int | None, timeout: floa
     payload = base64.b64encode(content.encode()).decode()
     chunks = [payload[i:i + CHUNK_SIZE] for i in range(0, len(payload), CHUNK_SIZE)]
     tmp = f"/tmp/.gns3api-{time.time_ns() % 9973:04d}.b64"
+    logger.info("push %r: %d bytes (%d chunks)", path, len(content), len(chunks))
 
     # Each step below is its OWN connection -- see module docstring. This
     # costs a reconnect per chunk (noticeably slower than one persistent
     # session would be), but a persistent session is not reliable here.
     exec_fn(f"rm -f {tmp}", timeout)
-    for chunk in chunks:
+    for chunk_no, chunk in enumerate(chunks, 1):
+        logger.debug("push %r: chunk %d/%d", path, chunk_no, len(chunks))
         exec_fn(f"printf '%s' '{chunk}' >> {tmp}", timeout)
 
     expected = str(len(payload))
@@ -346,7 +363,9 @@ def _push_file(exec_fn, path: str, content: str, mode: int | None, timeout: floa
     if str(len(content)) not in out:
         raise RuntimeError(f"after-write size check failed for {path} - got {out!r}")
 
-    return f"written {path}: {len(content)} bytes" + (f" (mode {mode:o})" if mode else "")
+    result = f"written {path}: {len(content)} bytes" + (f" (mode {mode:o})" if mode else "")
+    logger.info("push %s", result)
+    return result
 
 
 def push_file(
@@ -376,13 +395,16 @@ def _pull_file(exec_fn, path: str, timeout: float) -> str:
     """Reads ``path`` through a console session (any path, /root included).
     The node base64-encodes the file into one output line, so binary
     content survives the transport; the caller receives the decoded text."""
+    logger.info("pull %r", path)
     out = exec_fn(f"base64 -w0 {path} 2>/dev/null", timeout)
     # bracketed-paste toggles (esc[?2004l) ride along inside long output
     # echo -- without stripping them the payload misaligns
     payload = "".join(out.split())
     if not payload:
         raise RuntimeError(f"{path} unreadable or empty on the node")
-    return base64.b64decode(payload).decode()
+    content = base64.b64decode(payload).decode()
+    logger.debug("pull %r: %d bytes", path, len(content))
+    return content
 
 
 def pull_file(host: str, port: int, path: str, timeout: float = 60.0) -> str:
@@ -415,14 +437,17 @@ def _pull_file_chunked(exec_fn, path: str, timeout: float, page: int) -> str:
         if not numbers:
             raise RuntimeError(f"could not count b64 lines for {path}: {nl_out!r}")
         nlines = int(numbers[0])
+        npages = (nlines + page - 1) // page
+        logger.info("pull %r chunked: %d base64 lines, %d pages", path, nlines, npages)
 
         md5_out = exec_fn(f"md5sum {path} | cut -d' ' -f1", timeout)
         node_md5_m = re.search(r"([0-9a-f]{32})", md5_out)
         node_md5 = node_md5_m.group(1) if node_md5_m else None
 
         parts = []
-        for start in range(1, nlines + 1, page):
+        for page_no, start in enumerate(range(1, nlines + 1, page), 1):
             end = min(start + page - 1, nlines)
+            logger.debug("pull %r: page %d/%d", path, page_no, npages)
             out = exec_fn(f"echo '#START#'; sed -n '{start},{end}p' {staged}", timeout)
             # everything up to the LAST '#START#' is echoed-command residue
             # (the echoed command itself contains the literal); the payload
@@ -433,12 +458,15 @@ def _pull_file_chunked(exec_fn, path: str, timeout: float, page: int) -> str:
 
     payload = "".join("".join(_ANSI_RE.sub("", p).split()) for p in parts)
     content = base64.b64decode(payload).decode()
+    verified = ""
     if node_md5:
         local_md5 = hashlib.md5(content.encode()).hexdigest()
         if local_md5 != node_md5:
             raise RuntimeError(
                 f"integrity mismatch on {path}: node {node_md5} != local {local_md5}; "
                 f"decoded head: {content[:60]!r}")
+        verified = ", md5 verified"
+    logger.info("pull %r chunked done: %d bytes%s", path, len(content), verified)
     return content
 
 

@@ -8,7 +8,9 @@ server's own OpenAPI spec (`/openapi.json`).
 """
 from __future__ import annotations
 
+import logging
 import random
+import sys
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -20,6 +22,19 @@ import websocket
 from .console import USER_AGENT, Console, WsConsole, pull_file, push_file, ws_interactive, ws_pull_file, ws_push_file
 from .exceptions import Gns3ApiError
 
+logger = logging.getLogger(__name__)
+
+
+def _setup_verbose() -> None:
+    # idempotent: repeated construction must not stack duplicate handlers
+    lg = logging.getLogger("gns3api")
+    if not lg.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        lg.addHandler(handler)
+        lg.setLevel(logging.INFO)
+        lg.propagate = False
+
 
 class Gns3Client:
     def __init__(
@@ -30,7 +45,10 @@ class Gns3Client:
         verify: bool = False,
         delay_range: Optional[tuple[float, float]] = None,
         timeout: tuple[float, float] = (10.0, 60.0),
+        verbose: bool = False,
     ):
+        if verbose:
+            _setup_verbose()
         self.base_url = base_url.rstrip("/")
         self.username = username
         self.password = password
@@ -59,6 +77,7 @@ class Gns3Client:
         verify: bool = False,
         delay_range: Optional[tuple[float, float]] = None,
         timeout: tuple[float, float] = (10.0, 60.0),
+        verbose: bool = False,
     ) -> "Gns3Client":
         """Builds a client from a simple "Key: Value" creds file (e.g. a
         course project's gitignored creds.txt), reading whichever of
@@ -79,10 +98,11 @@ class Gns3Client:
             raise ValueError(f"{path}: missing {', '.join(missing)}")
 
         base_url = host if "://" in host else f"http://{host}"
-        return cls(base_url, username, password, verify=verify, delay_range=delay_range, timeout=timeout)
+        return cls(base_url, username, password, verify=verify, delay_range=delay_range, timeout=timeout, verbose=verbose)
 
     # -- auth -----------------------------------------------------------
     def authenticate(self) -> str:
+        logger.info("authenticating as %s", self.username)
         resp = self.session.post(
             f"{self.base_url}/v3/access/users/login",
             data={"username": self.username, "password": self.password},
@@ -115,6 +135,8 @@ class Gns3Client:
                 if self._token is not None:
                     self.session.headers["Authorization"] = f"Bearer {self._token}"
                 if attempt < retries:
+                    logger.info("connection error on %s %s - reconnecting, retry %d/%d",
+                                method, url, attempt + 1, retries)
                     time.sleep(0.5 * (attempt + 1) * random.uniform(0.5, 1.5))
         raise last_error
 
@@ -124,12 +146,15 @@ class Gns3Client:
 
     def _request(self, method: str, path: str, retries: int = 3, raw: bool = False, **kwargs) -> Any:
         if self.delay_range:
-            time.sleep(random.uniform(*self.delay_range))
+            pause = random.uniform(*self.delay_range)
+            logger.debug("delaying %.2fs (delay_range)", pause)
+            time.sleep(pause)
         self._ensure_auth()
         url = f"{self.base_url}{path}"
         resp = self._send_with_retry(method, url, retries, **kwargs)
         if resp.status_code == 401 and self._token is not None:
             # token may have expired; retry once after re-authenticating
+            logger.info("401 on %s %s - re-authenticating", method, path)
             self.authenticate()
             resp = self._send_with_retry(method, url, retries, **kwargs)
         # 409 from project open means "Project is closing, please try
@@ -141,8 +166,10 @@ class Gns3Client:
         retryable_409 = resp.status_code == 409 and "closing" in resp.text.lower()
         retryable_timeout = resp.status_code in self._RETRYABLE_CODES and method in ("GET", "PUT", "HEAD", "OPTIONS")
         if retryable_409 or retryable_timeout:
+            logger.info("%d on %s %s - retrying once", resp.status_code, method, path)
             time.sleep(1.0 * random.uniform(0.5, 1.5))
             resp = self._send_with_retry(method, url, retries, **kwargs)
+        logger.debug("%s %s -> %s", method, path, resp.status_code)
         if not resp.ok:
             try:
                 detail = resp.json().get("detail", resp.text)
@@ -290,6 +317,7 @@ class Gns3Client:
         except Gns3ApiError as exc:
             if exc.status_code != 403:
                 raise
+            logger.info("project %s is not opened (403) - opening it", project_id)
             self.open_project(project_id)
             return fn()
 
@@ -374,16 +402,22 @@ class Gns3Client:
 
         node = get_node_healed()
         if node.get("status") == "started":
+            logger.debug("node %s already running", node_id)
             return
+        logger.info("node %s is %s - starting it", node_id, node.get("status", "unknown"))
         self.start_node(project_id, node_id)
         deadline = time.time() + wait
+        polls = 0
         while time.time() < deadline:
             time.sleep(1)
+            polls += 1
             if get_node_healed().get("status") == "started":
+                logger.info("node %s started (waited %ds)", node_id, polls)
                 # debinet's boot runs /root/init.sh synchronously; give
                 # the resulting shell a settle window before console work
                 time.sleep(5)
                 return
+            logger.debug("node %s still not started (poll %d/%ds)", node_id, polls, wait)
         raise Gns3ApiError(
             500,
             f"node did not reach started state within {wait}s "
@@ -409,6 +443,8 @@ class Gns3Client:
             except (ConnectionError, OSError, RuntimeError, websocket.WebSocketException) as exc:
                 last_error = exc
                 if attempt < retries:
+                    logger.info("console attempt %d/%d failed (%s) - retrying",
+                                attempt + 1, retries + 1, exc)
                     if isinstance(exc, websocket.WebSocketException):
                         # a rejected ws console handshake usually means the
                         # JWT went stale (server closes auth failures at
